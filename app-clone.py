@@ -611,18 +611,13 @@ class StreamlitApp:
                 
                 # Add correlation interpretation guide
                 with st.expander("📊 Understanding Correlation Values"):
-                    st.markdown("""
+                    st.write("""
                     | Correlation Range | Strength | Interpretation |
                     |-------------------|-----------|----------------|
                     | 0.7 to 1.0 | Strong | Strong positive relationship |
                     | 0.4 to 0.7 | Moderate | Moderate positive relationship |
                     | 0.0 to 0.4 | Weak | Weak positive relationship |
                     | -1.0 to 0.0 | Negative | Negative relationship |
-                    
-                    - **Strong**: Changes in one variable strongly predict changes in another
-                    - **Moderate**: There's a noticeable but not dominant relationship
-                    - **Weak**: Variables have minimal influence on each other
-                    - **Negative**: Variables move in opposite directions
                     """)
                 
                 # Revenue prediction section
