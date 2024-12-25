@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+*$py.class
+venv_py311/
+.env
+.DS_Store 
