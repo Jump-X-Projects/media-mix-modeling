@@ -178,42 +178,70 @@ class StreamlitApp:
             y='Channel',
             orientation='h',
             title='Channel Impact Analysis',
-            template='plotly_dark'
+            template='plotly_dark',
+            color='Importance',
+            color_continuous_scale='Purples'
         )
-        fig.update_layout(height=400)
+        fig.update_layout(
+            height=400,
+            showlegend=False,
+            coloraxis_showscale=False
+        )
         st.plotly_chart(fig, use_container_width=True)
         
     def plot_correlation_matrix(self, df: pd.DataFrame):
         """Plot correlation matrix."""
         corr = df.corr()
         
-        fig = px.imshow(
-            corr,
+        # Overall correlation matrix
+        fig = go.Figure(data=go.Heatmap(
+            z=corr,
+            x=corr.columns,
+            y=corr.columns,
+            colorscale=[
+                [0, 'rgb(244, 67, 54)'],     # Red for negative
+                [0.5, 'rgb(255, 255, 255)'],  # White for zero
+                [1, 'rgb(76, 175, 80)']       # Green for positive
+            ],
+            zmin=-1,
+            zmax=1
+        ))
+        fig.update_layout(
             title='Overall Correlation Matrix',
             template='plotly_dark',
-            color_continuous_scale='RdBu'
+            height=500,
+            xaxis={'side': 'bottom'}
         )
-        fig.update_layout(height=500)
         st.plotly_chart(fig, use_container_width=True)
         
         # Individual channel correlations
-        cols = 2
-        rows = (len(df.columns) + 1) // cols
-        
-        for i, col in enumerate(df.columns[:-1]):  # Exclude revenue column
+        for col in df.columns[:-1]:  # Exclude revenue column
             correlations = df[col].corr(df[self.data_processor.revenue_column])
             fig = go.Figure()
             fig.add_trace(go.Bar(
-                x=[col],
+                x=[0],
                 y=[correlations],
                 name=col,
-                marker_color='#00ff00' if correlations > 0 else '#ff0000'
+                marker_color='#00FF00' if correlations > 0 else '#FF0000',
+                width=0.8,
+                showlegend=False
             ))
             fig.update_layout(
                 title=f'{col} Revenue Correlation',
                 template='plotly_dark',
                 showlegend=False,
-                height=300
+                height=200,
+                margin=dict(l=20, r=20, t=40, b=20),
+                yaxis=dict(
+                    range=[-1, 1],
+                    tickformat='.3f',
+                    gridcolor='rgba(128,128,128,0.2)',
+                    title=None
+                ),
+                xaxis=dict(
+                    showticklabels=False,
+                    title=None
+                )
             )
             st.plotly_chart(fig, use_container_width=True)
     
@@ -263,16 +291,31 @@ class StreamlitApp:
                 
                 # Display key metrics
                 col1, col2, col3, col4 = st.columns(4)
+                avg_revenue = df[self.data_processor.revenue_column].mean()
+                train_rmse_pct = (metrics['train_rmse'] / avg_revenue) * 100
+                test_rmse_pct = (metrics['test_rmse'] / avg_revenue) * 100
+
                 with col1:
                     st.metric("Training RMSE", f"${metrics['train_rmse']:,.2f}")
+                    st.metric("as % of Revenue", f"{train_rmse_pct:.1f}%")
                 with col2:
                     st.metric("Test RMSE", f"${metrics['test_rmse']:,.2f}")
+                    st.metric("as % of Revenue", f"{test_rmse_pct:.1f}%")
                 with col3:
                     st.metric("R² Score", f"{metrics['r2_score']:.3f}")
                 with col4:
-                    avg_revenue = df[self.data_processor.revenue_column].mean()
                     st.metric("Avg Daily Revenue", f"${avg_revenue:,.2f}")
-                
+
+                # Add model performance interpretation
+                if test_rmse_pct < 10:
+                    st.success("Model performance is excellent (RMSE < 10% of average revenue)")
+                elif test_rmse_pct < 15:
+                    st.info("Model performance is good (RMSE < 15% of average revenue)")
+                elif test_rmse_pct < 20:
+                    st.warning("Model performance is acceptable but could be improved")
+                else:
+                    st.error("Model performance needs improvement (RMSE > 20% of average revenue)")
+
                 # Visualizations
                 st.subheader("Model Insights")
                 
