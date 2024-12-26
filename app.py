@@ -215,34 +215,59 @@ class StreamlitApp:
         st.plotly_chart(fig, use_container_width=True)
         
         # Individual channel correlations
-        for col in df.columns[:-1]:  # Exclude revenue column
-            correlations = df[col].corr(df[self.data_processor.revenue_column])
+        def create_channel_correlation_plot(channel, correlations):
+            # Drop self-correlation
+            correlations = correlations.drop(channel)
+            if 'Date' in correlations.index:
+                correlations = correlations.drop('Date')
+            
+            # Define color mapping
+            def get_correlation_color(value):
+                if value >= 0.7:
+                    return "#FFD700"  # Gold for strong positive
+                elif value >= 0.4:
+                    return "#FFD700"  # Gold for moderate positive
+                elif value >= 0:
+                    return "#9C27B0"  # Purple for weak positive
+                elif value >= -0.4:
+                    return "#FF4444"  # Red for weak negative
+                else:
+                    return "#FF0000"  # Dark red for strong negative
+            
             fig = go.Figure()
-            fig.add_trace(go.Bar(
-                x=[0],
-                y=[correlations],
-                name=col,
-                marker_color='#00FF00' if correlations > 0 else '#FF0000',
-                width=0.8,
-                showlegend=False
-            ))
+            
+            # Add bars
+            for i, (idx, val) in enumerate(correlations.items()):
+                fig.add_trace(go.Bar(
+                    x=[idx],
+                    y=[val],
+                    name=idx,
+                    marker_color=get_correlation_color(val),
+                    showlegend=False
+                ))
+            
+            # Update layout
             fig.update_layout(
-                title=f'{col} Revenue Correlation',
+                title=f'{channel} Correlations',
                 template='plotly_dark',
-                showlegend=False,
-                height=200,
-                margin=dict(l=20, r=20, t=40, b=20),
+                height=300,
                 yaxis=dict(
+                    title='Correlation Strength',
                     range=[-1, 1],
-                    tickformat='.3f',
                     gridcolor='rgba(128,128,128,0.2)',
-                    title=None
+                    tickformat='.2f'
                 ),
                 xaxis=dict(
-                    showticklabels=False,
+                    tickangle=45,
                     title=None
-                )
+                ),
+                margin=dict(l=50, r=20, t=40, b=80)
             )
+            return fig
+        
+        # Create correlation plots for each channel
+        for channel in self.data_processor.feature_columns:
+            fig = create_channel_correlation_plot(channel, corr[channel])
             st.plotly_chart(fig, use_container_width=True)
     
     def run(self):
