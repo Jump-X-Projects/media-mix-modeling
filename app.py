@@ -1,380 +1,381 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import mean_squared_error, r2_score
-from sklearn.ensemble import GradientBoostingRegressor
+from data_preprocessing.data_preprocessor import DataPreprocessor
+from data_preprocessing.date_transformer import DateTransformer
+from data_preprocessing.data_setter import DataSetter
+from model.mmm_model import MMMModel
+from config.config import MEDIA_SPEND_COLUMNS, NON_MEDIA_COLUMNS, MEDIA_CHANNELS
+from config.config import DATE_FORMAT, COSTS
 import plotly.express as px
 import plotly.graph_objects as go
-import seaborn as sns
-import matplotlib.pyplot as plt
-from typing import Tuple, Optional
-import io
-import shap
+from plotly.subplots import make_subplots
 
-# Set page configuration
-st.set_page_config(
-    page_title="Media Mix Modeling App",
-    page_icon="📊",
-    layout="wide",
-    initial_sidebar_state="collapsed"
+# --- Custom CSS ---
+st.markdown(
+    """
+<style>
+/* Main background color */
+.stApp {
+    background-color: #f0f2f6;
+}
+
+/* Sidebar background color */
+.css-1d391kg {
+    background-color: #e0e2e6;
+}
+
+/* Header text */
+h1, h2, h3 {
+    color: #F63366; /* Your primary color */
+    font-family: 'Arial';
+}
+
+/* Body text */
+p, span, .st-eb, .st-en, .st-el, .st-eq {
+    font-family: 'Arial';
+}
+
+/* Button styles */
+.stButton>button {
+    color: #ffffff;
+    background-color: #F63366;
+    border-radius: 8px;
+    border: 2px solid #F63366;
+    font-family: 'Arial';
+}
+
+.stButton>button:hover {
+    background-color: #ffffff;
+    color: #F63366;
+    border: 2px solid #F63366;
+}
+
+/* Slider styles */
+.stSlider>div>div>div>div {
+    background-color: #F63366 !important; /* !important might be needed to override defaults */
+}
+
+/* Table styles */
+.ReactTable {
+  border-radius: 8px !important;
+  overflow: hidden !important;
+  border: 2px solid #F63366 !important;
+}
+
+.ReactTable .rt-thead {
+  background-color: #F63366 !important;
+  color: white !important;
+  font-family: 'Arial';
+}
+
+.ReactTable .rt-tbody .rt-td {
+  background-color: #f0f2f6 !important;
+  border-bottom: 1px solid #e0e2e6 !important;
+  font-family: 'Arial';
+}
+
+/* Input fields */
+.stTextInput>div>div>input, .stNumberInput>div>div>input {
+  border: 2px solid #F63366 !important;
+  border-radius: 8px !important;
+  font-family: 'Arial';
+}
+
+/* Selectbox */
+.stSelectbox>div>div>div {
+  border: 2px solid #F63366 !important;
+  border-radius: 8px !important;
+  font-family: 'Arial';
+}
+
+/* Radio buttons */
+.stRadio>div>label>div>div {
+  background-color: #F63366 !important;
+  border: 2px solid #F63366 !important;
+}
+
+.stRadio>div>label>div {
+  font-family: 'Arial';
+}
+
+</style>
+""",
+    unsafe_allow_html=True,
 )
 
-# Set dark theme
-st.markdown("""
-    <style>
-    .stApp {
-        background-color: #0E1117;
-        color: #FAFAFA;
-    }
-    .stButton>button {
-        background-color: #262730;
-        color: #FAFAFA;
-    }
-    .stTextInput>div>div>input {
-        background-color: #262730;
-        color: #FAFAFA;
-    }
-    </style>
-    """, unsafe_allow_html=True)
 
-class DataProcessor:
-    def __init__(self):
-        self.revenue_column = None
-        self.feature_columns = None
-        self.scaler = StandardScaler()
-        
-    def detect_revenue_column(self, df: pd.DataFrame) -> str:
-        """Detect the revenue column based on common names."""
-        revenue_keywords = ['revenue', 'sales', 'conversion', 'income']
-        for col in df.columns:
-            if any(keyword in col.lower() for keyword in revenue_keywords):
-                return col
-        return df.columns[-1]  # Default to last column if no match found
+st.title("Media Mix Modeling")
 
-    def validate_and_clean_data(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, bool, str]:
-        """Validate and clean the uploaded data."""
-        if df.empty:
-            return df, False, "The uploaded file is empty."
+# --- Sidebar for Data and Model Configuration ---
+st.sidebar.header("Data Upload & Configuration")
 
-        # Remove any completely empty rows or columns
-        df = df.dropna(how='all').dropna(axis=1, how='all')
-        
-        # Detect revenue column
-        self.revenue_column = self.detect_revenue_column(df)
-        
-        # Exclude 'Date' and revenue column from features
-        self.feature_columns = [col for col in df.columns 
-                              if col != self.revenue_column 
-                              and col != 'Date'
-                              and 'date' not in col.lower()]
+# Allow users to upload their own data
+uploaded_file = st.sidebar.file_uploader("Upload your CSV data", type=["csv"])
 
-        # Check if we have at least one feature column
-        if len(self.feature_columns) == 0:
-            return df, False, "No feature columns detected in the data."
+# Data and model configuration options
+date_column = st.sidebar.selectbox("Select Date Column", ["Date"])
+date_format = st.sidebar.selectbox("Select Date Format", list(DATE_FORMAT.keys()))
+target_variable = st.sidebar.selectbox("Select Target Variable (Sales)", ["Sales"])
 
-        # Convert all columns to numeric, replacing errors with NaN
-        for col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors='coerce')
+# --- Main Page Layout ---
+col1, col2 = st.columns([2, 1])
 
-        # Check for sufficient non-null values
-        if df[self.revenue_column].isna().sum() > 0.5 * len(df):
-            return df, False, f"Too many missing values in revenue column: {self.revenue_column}"
-
-        # Fill remaining NaN values with 0 for feature columns
-        df[self.feature_columns] = df[self.feature_columns].fillna(0)
-        
-        return df, True, "Data validation successful!"
-
-class ModelTrainer:
-    def __init__(self):
-        self.model = GradientBoostingRegressor(
-            n_estimators=5000,
-            learning_rate=0.01,
-            max_depth=5,
-            subsample=0.8,
-            min_samples_split=10,
-            min_samples_leaf=5,
-            loss='huber',
-            validation_fraction=0.2,
-            n_iter_no_change=50,
-            random_state=42
+with col1:
+    st.header("Model Inputs")
+    with st.expander("Media Channel Selection"):
+        media_channels = st.multiselect(
+            "Select Media Channels", MEDIA_SPEND_COLUMNS, default=MEDIA_CHANNELS
         )
-        self.scaler = StandardScaler()
-        self.feature_names = None
-        self.shap_values = None
-        
-    def _find_diminishing_returns(self, spend_levels, responses):
-        """Find the point of diminishing returns in the response curve."""
-        # Calculate rate of change
-        spend_diff = np.diff(spend_levels)
-        response_diff = np.diff(responses)
-        roi = response_diff / spend_diff
-        
-        # Find where ROI starts decreasing
-        roi_changes = np.diff(roi)
-        try:
-            diminishing_idx = np.where(roi_changes < 0)[0][0]
-            return float(spend_levels[diminishing_idx])
-        except IndexError:
-            return float(spend_levels[-1])
-        
-    def prepare_and_train(self, df: pd.DataFrame, feature_cols: list, target_col: str) -> dict:
-        """Prepare data and train the model with improved preprocessing."""
-        X = df[feature_cols]
-        y = df[target_col]
-        
-        # Split data chronologically
-        self.X_train, self.X_test, self.y_train, self.y_test = train_test_split(
-            X, y, test_size=0.2, shuffle=False
+    with st.expander("Model Parameters"):
+        adstock_type = st.selectbox("Select Adstock Type", ["geometric", "delayed"])
+        saturation_type = st.selectbox("Select Saturation Function", ["hill", "reach"])
+        spend_variables = st.multiselect(
+            "Select Spend Variables",
+            media_channels,
+            default=media_channels,
         )
-        
-        # Scale features
-        self.X_train_scaled = self.scaler.fit_transform(self.X_train)
-        self.X_test_scaled = self.scaler.transform(self.X_test)
-        
-        # Train model
-        self.model.fit(self.X_train_scaled, self.y_train)
-        
-        # Calculate metrics
-        train_preds = self.model.predict(self.X_train_scaled)
-        test_preds = self.model.predict(self.X_test_scaled)
-        
-        metrics = {
-            'train_rmse': np.sqrt(mean_squared_error(self.y_train, train_preds)),
-            'test_rmse': np.sqrt(mean_squared_error(self.y_test, test_preds)),
-            'r2_score': r2_score(self.y_test, test_preds),
-            'feature_importance': dict(zip(feature_cols, self.model.feature_importances_))
-        }
-        
-        # Calculate SHAP values for interpretation
-        explainer = shap.TreeExplainer(self.model)
-        self.shap_values = explainer.shap_values(self.X_test_scaled)
-        
-        return metrics
-    
-    def predict(self, input_data: pd.DataFrame) -> float:
-        """Make prediction with scaled input."""
-        input_scaled = self.scaler.transform(input_data)
-        prediction = self.model.predict(input_scaled)[0]
-        return max(prediction, input_data.values.sum() * 1.2)  # Minimum 1.2x ROAS
+        date_format_selected = DATE_FORMAT[date_format]
+        scaler_type = st.selectbox("Select Scaler Type", ["MinMaxScaler", "MaxAbsScaler"])
 
-class StreamlitApp:
-    def __init__(self):
-        self.data_processor = DataProcessor()
-        self.model_trainer = ModelTrainer()
-        
-    def plot_channel_impact(self, df: pd.DataFrame, metrics: dict):
-        """Plot channel impact analysis."""
-        feature_imp = pd.DataFrame(
-            list(metrics['feature_importance'].items()),
-            columns=['Channel', 'Importance']
-        ).sort_values('Importance', ascending=True)
-        
+        st.write("Hyperparameter Optimization")
+        hyperparameter_tuning_df = pd.DataFrame(
+            {
+                "Channel": media_channels,
+                "Alpha (Lag)": [0.5] * len(media_channels),
+                "Beta (Saturation)": [0.5] * len(media_channels),
+                "Gamma (Decay)": [0.5] * len(media_channels),
+            }
+        )
+        edited_hyperparameter_df = st.data_editor(
+            hyperparameter_tuning_df,
+            column_config={
+                "Channel": st.column_config.TextColumn(
+                    "Channel",
+                    help="Media Channel",
+                    default="tv_S",
+                    max_chars=50,
+                    disabled=True,
+                    required=True,
+                ),
+                "Alpha (Lag)": st.column_config.NumberColumn(
+                    "Alpha (Lag)",
+                    help="Lag effect for adstock transformation",
+                    default=0.5,
+                    min_value=0.0,
+                    max_value=1.0,
+                    step=0.01,
+                    format="%.2f",
+                ),
+                "Beta (Saturation)": st.column_config.NumberColumn(
+                    "Beta (Saturation)",
+                    help="Saturation effect for diminishing returns",
+                    default=0.5,
+                    min_value=0.0,
+                    max_value=1.0,
+                    step=0.01,
+                    format="%.2f",
+                ),
+                "Gamma (Decay)": st.column_config.NumberColumn(
+                    "Gamma (Decay)",
+                    help="Decay rate for adstock",
+                    default=0.5,
+                    min_value=0.0,
+                    max_value=1.0,
+                    step=0.01,
+                    format="%.2f",
+                ),
+            },
+            num_rows="dynamic",
+            width=800,
+        )
+
+    with col2:
+        st.header("Settings")
+        with st.expander("Model Settings"):
+            n_chains = st.slider("Number of Chains", min_value=1, max_value=5, value=2)
+            n_draws = st.slider("Number of Samples", min_value=500, max_value=5000, value=1000)
+            n_tune = st.slider("Number of Tuning Steps", min_value=500, max_value=5000, value=1000)
+
+# Initialize data setter
+data_setter = DataSetter(date_column, media_channels, target_variable, uploaded_file)
+data_setter.set_data()
+df = data_setter.get_data()
+
+if df is not None:
+    date_transformer = DateTransformer(date_column, date_format_selected)
+    df = date_transformer.transform(df)
+
+    data_preprocessor = DataPreprocessor(
+        df,
+        date_column,
+        media_channels,
+        NON_MEDIA_COLUMNS,
+        target_variable,
+        adstock_type,
+        saturation_type,
+        spend_variables,
+        scaler_type,
+        hyperparameters=edited_hyperparameter_df.set_index("Channel").to_dict(
+            "index"
+        ),
+    )
+    df = data_preprocessor.preprocess()
+
+    # Model fitting
+    mmm = MMMModel(
+        df,
+        target_variable,
+        date_column,
+        media_channels,
+        NON_MEDIA_COLUMNS,
+        n_draws,
+        n_tune,
+        n_chains,
+        adstock_type,
+        saturation_type,
+        hyperparameters=edited_hyperparameter_df.set_index("Channel").to_dict(
+            "index"
+        ),
+    )
+    mmm.fit()
+
+    # --- Plotting Functions ---
+    def plot_actual_vs_predicted(df, y_true, y_pred):
+        fig = make_subplots(specs=[[{"secondary_y": True}]])
+        # Add actual values trace
+        fig.add_trace(
+            go.Scatter(
+                x=df.index,
+                y=df[y_true],
+                mode="lines",
+                name="Actual",
+                line=dict(color="#F63366"),
+            ),
+            secondary_y=False,
+        )
+        # Add predicted values trace
+        fig.add_trace(
+            go.Scatter(
+                x=df.index,
+                y=df[y_pred],
+                mode="lines",
+                name="Predicted",
+                line=dict(color="#008080"),
+            ),
+            secondary_y=False,
+        )
+        # Customize layout
+        fig.update_layout(
+            title_text="Actual vs Predicted Values",
+            title_x=0.5,
+            xaxis_title="Date",
+            yaxis_title="Value",
+            font=dict(family="Arial", size=12, color="#262730"),
+            plot_bgcolor="rgba(0,0,0,0)",
+            paper_bgcolor="#ffffff",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        )
+        # Customize axes
+        fig.update_xaxes(showline=True, linewidth=1, linecolor="black", mirror=True)
+        fig.update_yaxes(showline=True, linewidth=1, linecolor="black", mirror=True)
+        return fig
+
+    def plot_channel_contribution(media_contribution_df, channel):
         fig = px.bar(
-            feature_imp,
-            x='Importance',
-            y='Channel',
-            orientation='h',
-            title='Channel Impact Analysis',
-            template='plotly_dark',
-            color='Importance',
-            color_continuous_scale='Purples'
+            media_contribution_df,
+            x="date",
+            y=channel,
+            title=f"{channel} Contribution Over Time",
         )
         fig.update_layout(
-            height=400,
-            showlegend=False,
-            coloraxis_showscale=False
+            title_x=0.5,
+            xaxis_title="Date",
+            yaxis_title="Contribution",
+            font=dict(family="Arial", size=12, color="#262730"),
+            plot_bgcolor="rgba(0,0,0,0)",
+            paper_bgcolor="#ffffff",
         )
-        st.plotly_chart(fig, use_container_width=True)
-        
-    def plot_correlation_matrix(self, df: pd.DataFrame):
-        """Plot correlation matrix."""
-        corr = df.corr()
-        
-        # Overall correlation matrix
-        fig = go.Figure(data=go.Heatmap(
-            z=corr,
-            x=corr.columns,
-            y=corr.columns,
-            colorscale=[
-                [0, 'rgb(244, 67, 54)'],     # Red for negative
-                [0.5, 'rgb(255, 255, 255)'],  # White for zero
-                [1, 'rgb(76, 175, 80)']       # Green for positive
-            ],
-            zmin=-1,
-            zmax=1
-        ))
-        fig.update_layout(
-            title='Overall Correlation Matrix',
-            template='plotly_dark',
-            height=500,
-            xaxis={'side': 'bottom'}
-        )
-        st.plotly_chart(fig, use_container_width=True)
-        
-        # Individual channel correlations
-        def create_channel_correlation_plot(channel, correlations):
-            # Drop self-correlation
-            correlations = correlations.drop(channel)
-            if 'Date' in correlations.index:
-                correlations = correlations.drop('Date')
-            
-            # Define color mapping
-            def get_correlation_color(value):
-                if value >= 0.7:
-                    return "#FFD700"  # Gold for strong positive
-                elif value >= 0.4:
-                    return "#FFD700"  # Gold for moderate positive
-                elif value >= 0:
-                    return "#9C27B0"  # Purple for weak positive
-                elif value >= -0.4:
-                    return "#FF4444"  # Red for weak negative
-                else:
-                    return "#FF0000"  # Dark red for strong negative
-            
-            fig = go.Figure()
-            
-            # Add bars
-            for i, (idx, val) in enumerate(correlations.items()):
-                fig.add_trace(go.Bar(
-                    x=[idx],
-                    y=[val],
-                    name=idx,
-                    marker_color=get_correlation_color(val),
-                    showlegend=False
-                ))
-            
-            # Update layout
-            fig.update_layout(
-                title=f'{channel} Correlations',
-                template='plotly_dark',
-                height=300,
-                yaxis=dict(
-                    title='Correlation Strength',
-                    range=[-1, 1],
-                    gridcolor='rgba(128,128,128,0.2)',
-                    tickformat='.2f'
-                ),
-                xaxis=dict(
-                    tickangle=45,
-                    title=None
-                ),
-                margin=dict(l=50, r=20, t=40, b=80)
-            )
-            return fig
-        
-        # Create correlation plots for each channel
-        for channel in self.data_processor.feature_columns:
-            fig = create_channel_correlation_plot(channel, corr[channel])
-            st.plotly_chart(fig, use_container_width=True)
-    
-    def run(self):
-        st.title("📊 Media Mix Modeling App")
-        st.write("""
-        Upload your media spend and revenue data to train a model and make predictions.
-        The file should contain daily spend data for different channels and the corresponding revenue.
-        """)
+        fig.update_xaxes(showline=True, linewidth=1, linecolor="black", mirror=True)
+        fig.update_yaxes(showline=True, linewidth=1, linecolor="black", mirror=True)
+        return fig
 
-        uploaded_file = st.file_uploader(
-            "Upload your CSV or Excel file",
-            type=['csv', 'xlsx', 'xls'],
-            help="Make sure your file has a revenue column and channel spend columns"
-        )
-
-        if uploaded_file is not None:
-            try:
-                # Read the file
-                if uploaded_file.name.endswith('.csv'):
-                    df = pd.read_csv(uploaded_file)
-                else:
-                    df = pd.read_excel(uploaded_file)
-
-                # Validate and clean data
-                df, is_valid, message = self.data_processor.validate_and_clean_data(df)
-                
-                if not is_valid:
-                    st.error(message)
-                    return
-
-                st.success("Data loaded successfully!")
-                
-                # Display data overview
-                with st.expander("View Data Overview"):
-                    st.write("First few rows of your data:")
-                    st.dataframe(df.head())
-                    st.write("Data Summary:")
-                    st.dataframe(df.describe())
-
-                # Train model and display metrics
-                metrics = self.model_trainer.prepare_and_train(
-                    df,
-                    self.data_processor.feature_columns,
-                    self.data_processor.revenue_column
+    def plot_response_curves(df, media_channels, target_variable, spend_variables):
+        fig = go.Figure()
+        for channel in media_channels:
+            df_sorted = df.sort_values(by=channel)
+            fig.add_trace(
+                go.Scatter(
+                    x=df_sorted[channel],
+                    y=df_sorted[f"{channel}_{target_variable}_response_curve"],
+                    mode="lines",
+                    name=channel,
                 )
-                
-                # Display key metrics
-                col1, col2, col3, col4 = st.columns(4)
-                avg_revenue = df[self.data_processor.revenue_column].mean()
-                train_rmse_pct = (metrics['train_rmse'] / avg_revenue) * 100
-                test_rmse_pct = (metrics['test_rmse'] / avg_revenue) * 100
+            )
+        fig.update_layout(
+            title="Response Curves for Media Channels",
+            xaxis_title="Media Spend",
+            yaxis_title="Marginal Sales",
+            font=dict(family="Arial", size=12, color="#262730"),
+            plot_bgcolor="rgba(0,0,0,0)",
+            paper_bgcolor="#ffffff",
+        )
+        fig.update_xaxes(showline=True, linewidth=1, linecolor="black", mirror=True)
+        fig.update_yaxes(showline=True, linewidth=1, linecolor="black", mirror=True)
+        return fig
 
-                with col1:
-                    st.metric("Training RMSE", f"${metrics['train_rmse']:,.2f}")
-                    st.metric("as % of Revenue", f"{train_rmse_pct:.1f}%")
-                with col2:
-                    st.metric("Test RMSE", f"${metrics['test_rmse']:,.2f}")
-                    st.metric("as % of Revenue", f"{test_rmse_pct:.1f}%")
-                with col3:
-                    st.metric("R² Score", f"{metrics['r2_score']:.3f}")
-                with col4:
-                    st.metric("Avg Daily Revenue", f"${avg_revenue:,.2f}")
+    def plot_model_coefficients(mmm):
+        # Extract coefficients (betas) and plot them
+        coefficients = mmm.get_coefficients()
+        fig = px.bar(
+            coefficients,
+            x=coefficients.index,
+            y="Coefficient Value",
+            title="Model Coefficients (Betas)",
+        )
+        fig.update_layout(
+            title_x=0.5,
+            xaxis_title="Variable",
+            yaxis_title="Coefficient Value",
+            font=dict(family="Arial", size=12, color="#262730"),
+            plot_bgcolor="rgba(0,0,0,0)",
+            paper_bgcolor="#ffffff",
+        )
+        fig.update_xaxes(showline=True, linewidth=1, linecolor="black", mirror=True)
+        fig.update_yaxes(showline=True, linewidth=1, linecolor="black", mirror=True)
+        return fig
 
-                # Add model performance interpretation
-                if test_rmse_pct < 10:
-                    st.success("Model performance is excellent (RMSE < 10% of average revenue)")
-                elif test_rmse_pct < 15:
-                    st.info("Model performance is good (RMSE < 15% of average revenue)")
-                elif test_rmse_pct < 20:
-                    st.warning("Model performance is acceptable but could be improved")
-                else:
-                    st.error("Model performance needs improvement (RMSE > 20% of average revenue)")
+    # --- Visualizations ---
+    st.header("Model Results & Diagnostics")
+    if mmm.trace is not None:
+        # Model Coefficients
+        st.plotly_chart(plot_model_coefficients(mmm))
 
-                # Visualizations
-                st.subheader("Model Insights")
-                
-                # Channel Impact Analysis
-                self.plot_channel_impact(df, metrics)
-                
-                # Correlation Analysis
-                st.subheader("Channel Correlation Analysis")
-                self.plot_correlation_matrix(df)
-                
-                # Revenue Predictor
-                st.subheader("Revenue Predictor")
-                st.write("Enter spend values to predict revenue:")
-                
-                col_inputs = st.columns(len(self.data_processor.feature_columns))
-                input_data = {}
-                
-                for col, feature in zip(col_inputs, self.data_processor.feature_columns):
-                    with col:
-                        input_data[feature] = st.number_input(
-                            f"{feature}",
-                            value=float(df[feature].mean()),
-                            step=100.0
-                        )
-                
-                if st.button("Predict Revenue"):
-                    input_df = pd.DataFrame([input_data])
-                    prediction = self.model_trainer.predict(input_df)
-                    st.success(f"Predicted Daily Revenue: ${prediction:,.2f}")
+        # Actual vs. Predicted
+        st.plotly_chart(
+            plot_actual_vs_predicted(
+                mmm.df, mmm.target_variable, "target_prediction"
+            )
+        )
 
-            except Exception as e:
-                st.error(f"An error occurred: {str(e)}")
-                st.write("Please make sure your file is properly formatted and try again.")
+        # Media Channel Contributions
+        media_contribution_df = mmm.get_media_contribution()
+        for channel in media_channels:
+            st.plotly_chart(plot_channel_contribution(media_contribution_df, channel))
 
-if __name__ == "__main__":
-    app = StreamlitApp()
-    app.run()
+        # Response Curves
+        st.plotly_chart(
+            plot_response_curves(
+                mmm.df, media_channels, target_variable, spend_variables
+            )
+        )
+
+        # Optimization (if implemented in MMMModel)
+        if hasattr(mmm, "optimize_budget"):
+            st.header("Budget Optimization")
+            total_budget = st.number_input(
+                "Enter Total Budget", min_value=0.0, value=100000.0
+            )
+            if st.button("Optimize"):
+                optimal_allocations = mmm.optimize_budget(total_budget, spend_variables)
+                st.write(optimal_allocations)
