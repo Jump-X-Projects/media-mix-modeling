@@ -1,52 +1,89 @@
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Request, Form
+from fastapi.responses import JSONResponse
+from starlette.middleware.sessions import SessionMiddleware
 import pandas as pd
-import numpy as np
-from typing import Dict, List, Optional
+import io
 import uuid
 import json
-from io import StringIO
+from typing import Dict, Any
 
-from backend.models.model_factory import ModelFactory
-from backend.models.data_processor import DataProcessor
+from backend.data.processor import DataProcessor
+from backend.models.model_factory import ModelFactory, ModelCreationError
+from backend.models.spend_optimizer import SpendOptimizer
 
 app = FastAPI()
-
-# Add CORS middleware
 app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    SessionMiddleware,
+    secret_key="your-secret-key",
+    session_cookie="session_id"  # Use session_id as cookie name
 )
 
-# Store trained models in memory
-model_store = {}
+# Store session data
+sessions: Dict[str, Dict[str, Any]] = {}
 
-class PredictionRequest(BaseModel):
-    model_id: str
-    features: Dict[str, List[float]]
+async def get_session_id(request: Request) -> str:
+    """Get or create session ID"""
+    if 'session_id' not in request.session:
+        session_id = str(uuid.uuid4())
+        request.session['session_id'] = session_id
+        return session_id
+    return request.session['session_id']
 
-class PredictionResponse(BaseModel):
-    predictions: List[float]
-    uncertainty: Optional[Dict[str, List[float]]] = None
-
-@app.get("/api/health")
-async def health_check():
-    """Health check endpoint"""
-    return {"status": "healthy"}
-
-@app.get("/api/models")
-async def list_models():
-    """List available models"""
-    return {
-        "success": True,
-        "data": {
-            "models": ["linear", "lightgbm", "xgboost", "bayesian"]
+async def get_session_data(session_id: str = Depends(get_session_id)) -> Dict[str, Any]:
+    """Get session data"""
+    if session_id not in sessions:
+        sessions[session_id] = {
+            'data': None,
+            'processor': DataProcessor(),
+            'models': {}
         }
-    }
+    return sessions[session_id]
+
+@app.post("/api/upload")
+async def upload_data(
+    file: UploadFile = File(...),
+    session_id: str = Depends(get_session_id),
+    session_data: dict = Depends(get_session_data)
+):
+    """Upload and validate data"""
+    try:
+        # Read CSV data
+        contents = await file.read()
+        data = pd.read_csv(io.StringIO(contents.decode()))
+        
+        # Initialize processor
+        processor = session_data['processor']
+        
+        # Identify columns
+        spend_cols = [col for col in data.columns if 'spend' in col.lower()]
+        revenue_col = next(col for col in data.columns if 'revenue' in col.lower())
+        
+        # Setup processor with data
+        processor.setup(data, spend_cols, revenue_col)
+        
+        # Store in session
+        session_data['data'] = data
+        
+        return JSONResponse(
+            content={"message": "Data uploaded successfully"},
+            status_code=200
+        )
+        
+    except Exception as e:
+        return JSONResponse(
+            content={"details": str(e)},
+            status_code=400
+        )
+
+@app.get("/api/data")
+async def get_data(session_data: dict = Depends(get_session_data)):
+    """Get session data"""
+    if session_data['data'] is None:
+        return JSONResponse(
+            content={"details": "No data uploaded"},
+            status_code=404
+        )
+    return session_data['data'].to_dict(orient='records')
 
 @app.post("/api/train")
 async def train_model(
@@ -54,121 +91,160 @@ async def train_model(
     model_type: str = Form(...),
     media_columns: str = Form(...),
     target_column: str = Form(...),
-    num_epochs: Optional[int] = Form(1000),
-    learning_rate: Optional[float] = Form(0.01)
+    session_data: dict = Depends(get_session_data)
 ):
-    """Train a model on uploaded data"""
+    """Train a model"""
     try:
-        print(f"Training model: {model_type}")
-        print(f"Media columns: {media_columns}")
-        print(f"Target column: {target_column}")
+        # Read data if not already uploaded
+        if session_data['data'] is None:
+            contents = await file.read()
+            data = pd.read_csv(io.StringIO(contents.decode()))
+            session_data['data'] = data
+        else:
+            data = session_data['data']
         
-        # Read data
-        content = await file.read()
-        df = pd.read_csv(StringIO(content.decode('utf-8')))
-        print(f"Data shape: {df.shape}")
-        print(f"Columns: {df.columns.tolist()}")
-        
-        # Process columns
+        # Parse media columns
         media_cols = media_columns.split(',')
-        if not all(col in df.columns for col in media_cols + [target_column]):
-            missing = [col for col in media_cols + [target_column] if col not in df.columns]
-            raise HTTPException(status_code=400, detail=f"Missing columns: {missing}")
-            
+        
+        # Validate columns exist in data
+        missing_cols = [col for col in media_cols + [target_column] if col not in data.columns]
+        if missing_cols:
+            return JSONResponse(
+                content={"details": f"Missing required columns: {', '.join(missing_cols)}"},
+                status_code=400
+            )
+        
+        # Initialize processor
+        processor = session_data['processor']
+        
+        # Setup processor
+        processor.setup(data, media_cols, target_column)
+        
         # Create and train model
-        model = ModelFactory.create_model(
-            model_type,
-            num_epochs=num_epochs,
-            learning_rate=learning_rate
-        )
-        print(f"Created model: {model.__class__.__name__}")
+        factory = ModelFactory()
+        model = factory.create_model(model_type)
         
-        X = df[media_cols]
-        y = df[target_column]
-        print(f"Training data shape: X={X.shape}, y={y.shape}")
-        
+        X, y = processor.process(data)
         model.fit(X, y)
-        print("Model training completed")
         
         # Generate model ID and store
         model_id = str(uuid.uuid4())
-        model_store[model_id] = {
-            'model': model,
-            'media_columns': media_cols,
-            'target_column': target_column
-        }
-        print(f"Model stored with ID: {model_id}")
+        session_data['models'][model_id] = model
         
         return {"model_id": model_id}
         
+    except ModelCreationError as e:
+        return JSONResponse(
+            content={"details": str(e)},
+            status_code=400
+        )
     except Exception as e:
-        print(f"Error during training: {str(e)}")
-        raise HTTPException(status_code=400, detail=str(e))
+        return JSONResponse(
+            content={"details": str(e)},
+            status_code=400
+        )
 
-@app.post("/api/predict")
-async def predict(request: PredictionRequest):
-    """Make predictions using a trained model"""
+@app.get("/api/models/{model_id}")
+async def get_model(
+    model_id: str,
+    session_data: dict = Depends(get_session_data)
+):
+    """Get model by ID"""
+    if model_id not in session_data['models']:
+        return JSONResponse(
+            content={"details": "Model not found"},
+            status_code=404
+        )
+    return {"model_id": model_id}
+
+@app.get("/api/models")
+async def list_models(session_data: dict = Depends(get_session_data)):
+    """List all models"""
+    return {"models": list(session_data['models'].keys())}
+
+@app.post("/api/optimize")
+async def optimize_spend(
+    params: dict,
+    session_data: dict = Depends(get_session_data)
+):
+    """Optimize spend allocation"""
+    if not session_data['models']:
+        return JSONResponse(
+            content={"details": "No models available"},
+            status_code=404
+        )
+        
     try:
-        if request.model_id not in model_store:
-            raise HTTPException(status_code=404, detail="Model not found")
+        # Use the latest model
+        model_id = list(session_data['models'].keys())[-1]
+        model = session_data['models'][model_id]
+        
+        # Create optimizer
+        optimizer = SpendOptimizer(
+            model=model,
+            feature_names=session_data['processor'].media_columns,
+            historical_data=session_data['data']
+        )
+        
+        # Get current spend
+        current_spend = session_data['data'][session_data['processor'].media_columns].mean()
+        
+        # Optimize
+        result = optimizer.optimize(
+            current_spend=current_spend.values,
+            total_budget=params['budget']
+        )
+        
+        return result
+        
+    except Exception as e:
+        return JSONResponse(
+            content={"details": str(e)},
+            status_code=400
+        )
+
+@app.post("/api/cleanup")
+async def cleanup_session(session_id: str = Depends(get_session_id)):
+    """Clean up session data"""
+    if session_id in sessions:
+        del sessions[session_id]
+    return {"message": "Session cleaned up"}
+
+@app.post("/api/models/{model_id}/predict")
+async def predict(
+    model_id: str,
+    features: dict,
+    session_data: dict = Depends(get_session_data)
+):
+    """Make predictions with a model"""
+    try:
+        if model_id not in session_data['models']:
+            return JSONResponse(
+                content={"details": "Model not found"},
+                status_code=404
+            )
             
-        stored = model_store[request.model_id]
-        model = stored['model']
-        media_cols = stored['media_columns']
+        model = session_data['models'][model_id]
+        processor = session_data['processor']
         
         # Validate features
-        if not all(col in request.features for col in media_cols):
-            raise HTTPException(status_code=400, detail="Missing features")
+        required_features = processor.media_columns
+        missing_features = [f for f in required_features if f not in features]
+        if missing_features:
+            return JSONResponse(
+                content={"details": f"Missing features: {', '.join(missing_features)}"},
+                status_code=400
+            )
             
         # Create feature DataFrame
-        X = pd.DataFrame(request.features)
+        X = pd.DataFrame(features)
         
-        # Make predictions
-        predictions = model.predict(X).tolist()
-        
-        # Get uncertainty estimates for Bayesian model
-        response = {"predictions": predictions}
-        if hasattr(model, 'get_uncertainty_estimates'):
-            lower, upper = model.get_uncertainty_estimates(X)
-            response["uncertainty"] = {
-                "lower": lower.tolist(),
-                "upper": upper.tolist()
-            }
-            
-        return response
+        # Make prediction
+        predictions = model.predict(X)
+        return {"predictions": predictions.tolist()}
         
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-@app.post("/api/evaluate")
-async def evaluate_model(
-    file: UploadFile = File(...),
-    model_type: str = Form(...),
-    media_columns: str = Form(...),
-    target_column: str = Form(...),
-    cv_folds: int = Form(3)
-):
-    """Evaluate model using cross-validation"""
-    try:
-        # Read data
-        content = await file.read()
-        df = pd.read_csv(StringIO(content.decode('utf-8')))
-        
-        # Process columns
-        media_cols = media_columns.split(',')
-        if not all(col in df.columns for col in media_cols + [target_column]):
-            raise HTTPException(status_code=400, detail="Invalid column names")
-            
-        # Create model
-        model = ModelFactory.create_model(model_type)
-        
-        X = df[media_cols]
-        y = df[target_column]
-        
-        # Perform cross-validation
-        metrics = model.cross_validate(X, y, cv_folds)
-        
-        return {"metrics": metrics}
-        
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e)) 
+        return JSONResponse(
+            content={"details": str(e)},
+            status_code=400
+        ) 

@@ -100,35 +100,184 @@ def render_spend_optimization(model, processor):
     st.subheader("Spend Optimization")
     st.write("Find optimal spend allocation for maximum revenue")
     
-    # Total budget input
-    total_budget = st.number_input(
-        "Total Budget",
-        min_value=0.0,
-        value=1000.0,
-        step=100.0
-    )
+    try:
+        # Get current spend values
+        spend_cols = processor.media_columns
+        current_spend = processor.data[spend_cols].mean()
+        current_total = current_spend.sum()
+        
+        # Show current spend summary
+        st.write("Current Spend Summary:")
+        current_spend_df = pd.DataFrame({
+            'Channel': spend_cols,
+            'Current Spend': current_spend.values,
+            'Percentage': (current_spend.values / current_total) * 100
+        })
+        current_spend_df['Current Spend'] = current_spend_df['Current Spend'].apply(lambda x: f"${x:,.2f}")
+        current_spend_df['Percentage'] = current_spend_df['Percentage'].apply(lambda x: f"{x:.1f}%")
+        st.table(current_spend_df)
+        
+        # Total budget input with validation
+        st.write("Current total spend: ${:,.2f}".format(current_total))
+        col1, col2 = st.columns([2, 1])
+        with col1:
+            total_budget = st.number_input(
+                "Total Budget",
+                min_value=float(current_total * 0.5),  # Minimum 50% of current
+                max_value=float(current_total * 2),    # Maximum 200% of current
+                value=float(current_total),
+                step=current_total * 0.1,              # Step size 10% of current
+                format="%.2f",
+                help="Enter the total budget to optimize. Must be between 50% and 200% of current spend."
+            )
+        with col2:
+            st.metric(
+                "Budget Change",
+                f"${total_budget:,.2f}",
+                f"{((total_budget - current_total) / current_total) * 100:+.1f}%"
+            )
+        
+        # Create optimizer with historical data
+        optimizer = SpendOptimizer(
+            model=model,
+            feature_names=spend_cols,
+            historical_data=processor.data
+        )
+        
+        # Show optimization constraints before running
+        with st.expander("View Optimization Constraints", expanded=False):
+            st.markdown("""
+            The optimization follows these constraints:
+            - Total budget must be between 50% and 200% of current spend
+            - Individual channel spend cannot be negative
+            - Channel spend cannot exceed 150% of historical maximum
+            - Channel spend cannot be below historical minimum
+            - Total spend must equal specified budget
+            """)
+            
+            if optimizer.channel_bounds:
+                st.subheader("Channel-Specific Bounds")
+                bounds_df = pd.DataFrame([
+                    {
+                        'Channel': channel,
+                        'Minimum Spend': f"${bounds[0]:,.2f}",
+                        'Maximum Spend': f"${bounds[1]:,.2f}",
+                        'Current Spend': f"${current_spend[channel]:,.2f}"
+                    }
+                    for channel, bounds in optimizer.channel_bounds.items()
+                ])
+                st.table(bounds_df)
+        
+        if st.button("Optimize Allocation", help="Run optimization to find the best spend allocation"):
+            with st.spinner("Optimizing spend allocation..."):
+                try:
+                    # Run optimization
+                    best_allocation = optimizer.optimize(
+                        current_spend=current_spend.values,
+                        total_budget=total_budget
+                    )
+                    
+                    # Display results
+                    st.subheader("Optimal Allocation")
+                    
+                    # Create comparison dataframe
+                    comparison_df = pd.DataFrame({
+                        'Channel': list(best_allocation.keys()),
+                        'Current Spend': current_spend.values,
+                        'Optimized Spend': list(best_allocation.values()),
+                        'Change (%)': [(new - old) / old * 100 
+                                    for new, old in zip(best_allocation.values(), current_spend.values)]
+                    })
+                    
+                    # Bar chart comparing current vs optimized
+                    fig = go.Figure()
+                    fig.add_trace(go.Bar(
+                        name='Current',
+                        x=comparison_df['Channel'],
+                        y=comparison_df['Current Spend'],
+                        marker_color='lightgray'
+                    ))
+                    fig.add_trace(go.Bar(
+                        name='Optimized',
+                        x=comparison_df['Channel'],
+                        y=comparison_df['Optimized Spend'],
+                        marker_color='rgb(26, 118, 255)'
+                    ))
+                    fig.update_layout(
+                        title='Current vs Optimized Spend by Channel',
+                        barmode='group',
+                        yaxis_title='Spend ($)'
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+                    
+                    # Recommendations table
+                    st.subheader("Channel Recommendations")
+                    recommendations = []
+                    for _, row in comparison_df.iterrows():
+                        if row['Change (%)'] > 10:
+                            action = "Increase"
+                            rationale = "Opportunity for higher returns"
+                            icon = "📈"
+                        elif row['Change (%)'] < -10:
+                            action = "Decrease"
+                            rationale = "Potentially overinvested"
+                            icon = "📉"
+                        else:
+                            action = "Maintain"
+                            rationale = "Current spend is near optimal"
+                            icon = "✅"
+                        
+                        recommendations.append({
+                            'Channel': f"{icon} {row['Channel']}",
+                            'Action': action,
+                            'Current Spend': f"${row['Current Spend']:,.2f}",
+                            'Recommended Spend': f"${row['Optimized Spend']:,.2f}",
+                            'Change': f"{row['Change (%)']:+.1f}%",
+                            'Rationale': rationale
+                        })
+                    
+                    st.table(pd.DataFrame(recommendations))
+                    
+                    # Predicted impact
+                    current_X = processor.process(pd.DataFrame([current_spend]))[0]
+                    optimized_X = processor.process(pd.DataFrame([best_allocation]))[0]
+                    
+                    current_revenue = model.predict(current_X)[0]
+                    optimized_revenue = model.predict(optimized_X)[0]
+                    revenue_impact = (optimized_revenue - current_revenue) / current_revenue * 100
+                    
+                    st.subheader("Predicted Impact")
+                    impact_cols = st.columns(3)
+                    with impact_cols[0]:
+                        st.metric(
+                            "Current Revenue",
+                            f"${current_revenue:,.2f}"
+                        )
+                    with impact_cols[1]:
+                        st.metric(
+                            "Optimized Revenue",
+                            f"${optimized_revenue:,.2f}",
+                            f"{revenue_impact:+.1f}%"
+                        )
+                    with impact_cols[2]:
+                        roi_change = (optimized_revenue/total_budget - current_revenue/current_total) * 100
+                        st.metric(
+                            "ROI Change",
+                            f"{roi_change:+.1f}%",
+                            help="Change in return on investment"
+                        )
+                    
+                except SpendOptimizerError as e:
+                    st.error(f"🚫 Optimization Error: {str(e)}")
+                    st.info("Try adjusting the total budget or reviewing the optimization constraints.")
+                except Exception as e:
+                    st.error(f"⚠️ An unexpected error occurred: {str(e)}")
+                    st.warning("Please contact support if this error persists.")
     
-    if st.button("Optimize Allocation"):
-        # Simple grid search optimization
-        best_allocation, best_revenue = optimize_spend(
-            model,
-            processor,
-            total_budget,
-            processor.media_columns
-        )
-        
-        # Display results
-        st.subheader("Optimal Allocation")
-        
-        # Create bar chart
-        fig = px.bar(
-            x=list(best_allocation.keys()),
-            y=list(best_allocation.values()),
-            title="Recommended Spend Allocation"
-        )
-        st.plotly_chart(fig)
-        
-        st.metric("Predicted Revenue", f"${best_revenue:,.2f}")
+    except Exception as e:
+        st.error("Failed to initialize spend optimization:")
+        st.error(str(e))
+        st.info("Please ensure your data is properly loaded and contains valid spend values.")
 
 def render_roi_analysis(model, processor):
     """Render ROI analysis interface"""
